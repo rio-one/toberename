@@ -50,17 +50,32 @@ for exp_name in exp_list:
     save_metrics_path = os.path.join(save_obj_path, 'metrics.txt')
 
     mesh_list = os.listdir(exp_path)
-    mesh_list = [x for x in mesh_list if 'surface_' in x]
-    epoch_list = [int(x.split('_')[1]) for x in mesh_list]
+    # 严格过滤：只保留符合 surface_数字_数字.ply 格式的网格，排除所有中间文件
+    mesh_list = [x for x in mesh_list if 'surface_' in x and x.endswith('.ply') 
+                 and 'temp' not in x and 'ori' not in x and 'filtered' not in x and 'whole' not in x]
+    
+    # 安全提取 epoch 列表
+    epoch_list = []
+    for x in mesh_list:
+        try:
+            epoch_list.append(int(x.split('_')[1]))
+        except ValueError:
+            continue
+            
+    if len(epoch_list) == 0:
+        print(f"No valid mesh found in {exp_path}")
+        continue
+        
     max_epoch = max(epoch_list)
     eval_obj_list = [x for x in mesh_list if f'surface_{max_epoch}_' in x]
 
     for mesh_name in eval_obj_list:
 
-        if 'whole' in mesh_name:            # skip total scene
+        try:
+            obj_id = int(mesh_name.split('_')[-1].split('.')[0])
+        except ValueError:
+            # 如果解析不出物体编号，直接跳过
             continue
-
-        obj_id = int(mesh_name.split('_')[-1].split('.')[0])
         if obj_id == 0:                 # skip bg
             continue
 

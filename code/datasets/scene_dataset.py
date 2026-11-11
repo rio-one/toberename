@@ -9,6 +9,7 @@ from glob import glob
 import cv2
 import random
 import json
+from utils.op_sampling import InstanceBoundarySampler
 
 def rot_cameras_along_x(pose_matrix, angle):
     theta = angle * np.pi / 180
@@ -46,7 +47,11 @@ class SceneDatasetDN_segs(torch.utils.data.Dataset):
                  scan_id=0,
                  center_crop_type='xxxx',
                  use_mask=False,
-                 num_views=-1
+                 num_views=-1,
+                 op_balanced_sampling=False,
+                 op_instance_fraction=0.25,
+                 op_boundary_fraction=0.25,
+                 op_boundary_width=5
                  ):
 
         # self.instance_dir = os.path.join('../data', data_dir, 'scan{0}'.format(scan_id))
@@ -215,6 +220,11 @@ class SceneDatasetDN_segs(torch.utils.data.Dataset):
                 mask = np.load(path)
                 self.mask_images.append(torch.from_numpy(mask.reshape(-1, 1)).float())
 
+        # Each worker draws from the current view rather than a stale global index.
+        self.op_sampler = (InstanceBoundarySampler(
+            self.semantic_images, self.img_res, op_instance_fraction,
+            op_boundary_fraction, op_boundary_width) if op_balanced_sampling else None)
+
     def __len__(self):
         return self.n_images
 
@@ -243,17 +253,20 @@ class SceneDatasetDN_segs(torch.utils.data.Dataset):
 
         if self.sampling_idx is not None:
             if (self.random_image_for_path is None) or (idx not in self.random_image_for_path):
-                # print('sampling_idx:', self.sampling_idx)
-                ground_truth["rgb"] = self.rgb_images[idx][self.sampling_idx, :]
+                sampling_idx = self.sampling_idx
+                if self.op_sampler is not None:
+                    sampling_idx, rgb_weights = self.op_sampler.sample(idx, len(sampling_idx))
+                    ground_truth['rgb_sampling_weight'] = rgb_weights
+                ground_truth["rgb"] = self.rgb_images[idx][sampling_idx, :]
                 ground_truth["full_rgb"] = self.rgb_images[idx]
-                ground_truth["normal"] = self.normal_images[idx][self.sampling_idx, :]
-                ground_truth["depth"] = self.depth_images[idx][self.sampling_idx, :]
+                ground_truth["normal"] = self.normal_images[idx][sampling_idx, :]
+                ground_truth["depth"] = self.depth_images[idx][sampling_idx, :]
                 ground_truth["full_depth"] = self.depth_images[idx]
-                ground_truth["mask"] = self.mask_images[idx][self.sampling_idx, :]
+                ground_truth["mask"] = self.mask_images[idx][sampling_idx, :]
                 ground_truth["full_mask"] = self.mask_images[idx]
-                ground_truth["segs"] = self.semantic_images[idx][self.sampling_idx, :]
+                ground_truth["segs"] = self.semantic_images[idx][sampling_idx, :]
             
-                sample["uv"] = uv[self.sampling_idx, :]
+                sample["uv"] = uv[sampling_idx, :]
                 sample["is_patch"] = torch.tensor([False])
             else:
                 # sampling a patch from the image, this could be used for training with depth total variational loss
@@ -300,7 +313,9 @@ class SceneDatasetDN_segs(torch.utils.data.Dataset):
             self.random_image_for_path = None
         else:
             if sampling_pattern == 'random':
-                self.sampling_idx = torch.randperm(self.total_pixels)[:sampling_size]
+                self.sampling_idx = (torch.empty(sampling_size, dtype=torch.long)
+                                     if self.op_sampler is not None else
+                                     torch.randperm(self.total_pixels)[:sampling_size])
                 self.random_image_for_path = None
             elif sampling_pattern == 'patch':
                 self.sampling_idx = torch.randperm(self.total_pixels)[:sampling_size]

@@ -178,10 +178,18 @@ class MonoSDFLoss(nn.Module):
         self.step = 0
         self.end_step = end_step
 
-    def get_rgb_loss(self,rgb_values, rgb_gt):
+    def get_rgb_loss(self, rgb_values, rgb_gt, sampling_weight=None):
         rgb_gt = rgb_gt.reshape(-1, 3)
-        rgb_loss = self.rgb_loss(rgb_values, rgb_gt)
-        return rgb_loss
+        if sampling_weight is None:
+            return self.rgb_loss(rgb_values, rgb_gt)
+        if isinstance(self.rgb_loss, nn.L1Loss):
+            per_pixel = (rgb_values - rgb_gt).abs().mean(dim=-1)
+        elif isinstance(self.rgb_loss, nn.MSELoss):
+            per_pixel = (rgb_values - rgb_gt).square().mean(dim=-1)
+        else:
+            raise TypeError('OP importance sampling supports L1Loss or MSELoss')
+        weight = sampling_weight.to(device=per_pixel.device, dtype=per_pixel.dtype).reshape(-1)
+        return (per_pixel * weight).mean()
 
     def get_eikonal_loss(self, grad_theta):
         eikonal_loss = ((grad_theta.norm(2, dim=1) - 1) ** 2).mean()
@@ -252,7 +260,8 @@ class MonoSDFLoss(nn.Module):
         depth_pred = model_outputs['depth_values']
         normal_pred = model_outputs['normal_map'][None]
         
-        rgb_loss = self.get_rgb_loss(model_outputs['rgb_values'], rgb_gt)
+        rgb_loss = self.get_rgb_loss(model_outputs['rgb_values'], rgb_gt,
+                                     ground_truth.get('rgb_sampling_weight'))
         
         if 'grad_theta' in model_outputs:
             eikonal_loss = self.get_eikonal_loss(model_outputs['grad_theta'])
@@ -476,6 +485,7 @@ class DPReconLoss(MonoSDFLoss):
         else:
             bg_surface_obj_reg = torch.tensor(0.0).cuda().float()
 
+        reconstruction_loss = output['loss']
         # add sds loss
         if 'loss_rgb_sd' in model_outputs:
             loss_rgb_sd = model_outputs['loss_rgb_sd']
@@ -487,5 +497,12 @@ class DPReconLoss(MonoSDFLoss):
         output['semantic_loss'] = semantic_loss
         output['collision_reg_loss'] = sample_sdf_loss
         output['background_reg_loss'] = background_reg_loss
-        output['loss'] = output['loss'] + self.semantic_weight * semantic_loss + self.reg_vio_weight* sample_sdf_loss + self.bg_reg_weight * background_reg_loss + self.bg_surface_obj_reg_weight * bg_surface_obj_reg
+        regularization_loss = (self.semantic_weight * semantic_loss +
+                               self.reg_vio_weight * sample_sdf_loss +
+                               self.bg_reg_weight * background_reg_loss +
+                               self.bg_surface_obj_reg_weight * bg_surface_obj_reg)
+        output['loss'] = output['loss'] + regularization_loss
+        # Keep the reference graph independent of SDS; subtraction would still
+        # traverse the expensive prior graph during the reference backward.
+        output['reconstruction_loss'] = reconstruction_loss + regularization_loss
         return output

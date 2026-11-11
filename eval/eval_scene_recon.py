@@ -53,10 +53,10 @@ for exp_name in exp_list:
     if dataset_type == 'replica':
         input_scalemat = os.path.join(data_root_path, f'scan{scan_id}', 'cameras.npz')
         traj = os.path.join(data_root_path, f'scan{scan_id}', 'traj.txt')
-        cmd = f'python eval/evaluate_single_scene.py --input_mesh {input_mesh} --gt_mesh {gt_mesh} --input_scalemat {input_scalemat} --traj {traj} --output_mesh {output_mesh} --output_txt {output_txt}'
+        cmd = f'python eval/evaluate_single_scene.py --input_mesh {input_mesh} --gt_mesh {gt_mesh} --input_scalemat {input_scalemat} --traj {traj} --output_mesh {output_mesh} --output_txt {output_txt} --none_fuse'
     else:
         input_scalemat = os.path.join(data_root_path, f'scan{scan_id}', 'eval_total_cameras.npz')
-        cmd = f'python eval/evaluate_single_scene.py --input_mesh {input_mesh} --gt_mesh {gt_mesh} --input_scalemat {input_scalemat} --output_mesh {output_mesh} --output_txt {output_txt}'
+        cmd = f'python eval/evaluate_single_scene.py --input_mesh {input_mesh} --gt_mesh {gt_mesh} --input_scalemat {input_scalemat} --output_mesh {output_mesh} --output_txt {output_txt} --none_fuse'
 
     print(cmd)
     os.system(cmd)

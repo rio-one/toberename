@@ -1,0 +1,14 @@
+Interpreter: /home/seed/miniconda3/envs/oprecon/bin/python
+PASS Python syntax and all three default configurations
+/home/seed/wangruiyao/OP-Recon/data/replica/scan1
+[INFO]: Dataset Size  10
+[INFO]: No need to fix camera pose for replica scan1
+PASS real scan1 samples, weights, collate, fallback, sampling-off and full-image paths
+PASS gradient projection: conflicting/aligned/zero/disjoint/disabled
+PASS gradient projection: conflicting/aligned/zero/disjoint/disabled
+PASS single-rank DDP no_sync + protected backward + optimizer step
+[INFO]: using weight for loss RGB_1.0 EK_0.1 SM_0.005 Depth_0.1 NormalL1_0.05 NormalCos_0.05            Semantic_1, semantic_loss_type_MSELoss() Use_object_opacity_True Reg_vio_0.5 BG_reg_0.1
+PASS geometry: actual DPReconLoss + trainer hook + higher-order gradient + Adam step {'op_conflict_rate': 0.0, 'op_gradient_cosine': 0.1552, 'op_prior_retention': 1.0}
+PASS texture: actual trainer hook + Adam step; frozen geometry preserved {'op_conflict_rate': 1.0, 'op_gradient_cosine': -0.93462, 'op_prior_retention': 0.35704}
+Peak CUDA allocated MiB: 17.37
+SMOKE PASSED. No pretrained diffusion load, full training, meshes or hash verification.

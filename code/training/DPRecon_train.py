@@ -1,4 +1,5 @@
 import imp
+from contextlib import nullcontext
 import os
 from datetime import datetime
 from pyhocon import ConfigFactory
@@ -17,6 +18,7 @@ import utils.plots as plt
 from utils import rend_util
 from utils.general import get_time
 from model.loss import compute_scale_and_shift
+from utils.op_gradients import observation_protected_backward
 from utils.general import BackprojectDepth
 from datasets.scene_dataset import rot_cameras_along_x, rot_cameras_along_y
 import matplotlib.pyplot as matplt
@@ -36,6 +38,11 @@ class DPReconTrainRunner():
         torch.set_num_threads(1)
 
         self.conf = ConfigFactory.parse_file(kwargs['conf'])
+        self.op_geometry_conflict = self.conf.get_bool('train.op_geometry_conflict', default=False)
+        self.op_texture_conflict = self.conf.get_bool('train.op_texture_conflict', default=False)
+        self.op_projection_strength = self.conf.get_float('train.op_projection_strength', default=1.0)
+        if not 0.0 <= self.op_projection_strength <= 1.0:
+            raise ValueError('train.op_projection_strength must be in [0, 1]')
         self.batch_size = kwargs['batch_size']
         self.nepochs = kwargs['nepochs']
         self.exps_folder_name = kwargs['exps_folder_name']
@@ -272,6 +279,23 @@ class DPReconTrainRunner():
             dst_prior_bbox_path = os.path.join(self.plots_dir, 'prior_bbox')
             shutil.copytree(continue_prior_bbox_path, dst_prior_bbox_path)
 
+
+    def _op_backward(self, reconstruction_loss, prior_loss, stage):
+        model = self.model.module
+        if stage == 'geometry':
+            implicit = model.implicit_network
+            groups = ({'sdf_grid': list(implicit.grid_parameters()),
+                       'sdf_mlp': list(implicit.mlp_parameters())} if self.Grid_MLP else
+                      {'sdf_mlp': list(implicit.parameters())})
+        elif stage == 'texture':
+            groups = {'texture_grid': list(model.mesh_color_network.pos_encoding.parameters()),
+                      'texture_mlp': list(model.mesh_color_network.layers.parameters())}
+        else:
+            raise ValueError('Unknown OP stage: ' + stage)
+        parameters = [p for group in self.optimizer.param_groups for p in group['params']]
+        return observation_protected_backward(
+            reconstruction_loss, prior_loss, parameters, groups,
+            strength=self.op_projection_strength)
 
     def save_checkpoints(self, epoch):
         if self.use_visgrid:
@@ -1010,8 +1034,15 @@ class DPReconTrainRunner():
                         sds_loss_dict = self.model.module.get_color_prior_loss()
                         sd_loss = sds_loss_dict['loss_rgb_sd']
 
-                        loss = scene_rgb_loss * self.scene_rgb_loss_weight + sd_loss * self.sds_rgb_loss_weight + bg_pano_loss * self.bg_pano_rgb_loss_weight             # scene rgb loss should be larger than sd loss
-                        loss.backward()
+                        loss = scene_rgb_loss * self.scene_rgb_loss_weight + sd_loss * self.sds_rgb_loss_weight + bg_pano_loss * self.bg_pano_rgb_loss_weight
+                        if self.op_texture_conflict:
+                            op_stats = self._op_backward(
+                                scene_rgb_loss * self.scene_rgb_loss_weight + bg_pano_loss * self.bg_pano_rgb_loss_weight,
+                                sd_loss * self.sds_rgb_loss_weight, stage='texture')
+                            if data_index % 20 == 0:
+                                print('[OP texture] ' + ', '.join(f'{k}={v.item():.4f}' for k, v in op_stats.items()))
+                        else:
+                            loss.backward()
 
                         self.optimizer.step()
                         self.scheduler.step()
@@ -1115,14 +1146,22 @@ class DPReconTrainRunner():
                     
                     self.optimizer.zero_grad()
                     
-                    model_outputs = self.model(model_input, indices, iter_step=self.iter_step, visgrid=self.visgrid)
-                    model_outputs['iter_step'] = self.iter_step
+                    controlled = self.op_geometry_conflict and self.model.module.begin_prior
+                    # autograd.grad uses explicit synchronization in the helper.
+                    # Keep the DDP forward and backward together inside no_sync.
+                    with self.model.no_sync() if controlled else nullcontext():
+                        model_outputs = self.model(model_input, indices, iter_step=self.iter_step, visgrid=self.visgrid)
+                        model_outputs['iter_step'] = self.iter_step
                     
-                    loss_output = self.loss(model_outputs, ground_truth, call_reg=True) if\
-                            self.iter_step >= self.add_objectvio_iter else self.loss(model_outputs, ground_truth, call_reg=False)
-                    # if change the pixel sampling pattern to patch, then you can add a TV loss to enforce some smoothness constraint
-                    loss = loss_output['loss']
-                    loss.backward()
+                        loss_output = self.loss(model_outputs, ground_truth, call_reg=True) if\
+                                self.iter_step >= self.add_objectvio_iter else self.loss(model_outputs, ground_truth, call_reg=False)
+                        # if change the pixel sampling pattern to patch, then you can add a TV loss to enforce some smoothness constraint
+                        loss = loss_output['loss']
+                        if controlled and 'sds_loss' in loss_output:
+                            loss_output.update(self._op_backward(
+                                loss_output['reconstruction_loss'], loss_output['sds_loss'], stage='geometry'))
+                        else:
+                            loss.backward()
 
                     # calculate gradient norm
                     total_norm = 0
@@ -1152,6 +1191,10 @@ class DPReconTrainRunner():
                                         loss_output['collision_reg_loss'].item(),
                                         loss_output['sds_loss'].item() if 'sds_loss' in loss_output else 0.0))
                         
+                        if 'op_conflict_rate' in loss_output:
+                            print('[OP geometry] ' + ', '.join(
+                                f'{k}={v.item():.4f}' for k, v in loss_output.items() if k.startswith('op_')))
+
                         if self.use_tensorboard:
                             for k, v in loss_output.items():
                                 self.writer.add_scalar(f'Loss/{k}', v.item(), self.iter_step)

@@ -14,3 +14,5 @@ code/train_dgx.slurm
 code/run.sh
 tiny-cuda-nn-master
 code/pretrained_models.zip
+# OP-Recon local smoke caches
+/.oprecon_cache/
