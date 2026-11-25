@@ -18,6 +18,7 @@ from plotly.subplots import make_subplots
 
 import os
 import json
+import warnings
 
 
 def plot(implicit_network, indices, plot_data, path, epoch, iter, img_res, plot_nimgs, resolution, grid_boundary, plot_mesh=True, obj_bbox_dict=None,  level=0):
@@ -70,7 +71,7 @@ def plot(implicit_network, indices, plot_data, path, epoch, iter, img_res, plot_
                                         iter=iter,
                                         #    sdf=lambda x: -f(-implicit_network(x)[:, :6]),
                                         sdf = lambda x: implicit_network.get_sdf_raw(x),
-                                        resolution=256,
+                                        resolution=resolution,
                                         grid_boundary=grid_boundary,
                                         level=level,
                                         num = sem_num,
@@ -89,7 +90,7 @@ def plot(implicit_network, indices, plot_data, path, epoch, iter, img_res, plot_
         _ = get_surface_trace(path=path,
                             epoch=epoch,
                             sdf=lambda x: implicit_network.get_sdf_vals(x),
-                            resolution=768,
+                            resolution=resolution,
                             grid_boundary=grid_boundary,
                             level=level
                             )
@@ -214,7 +215,7 @@ def get_surface_trace(path, epoch, sdf, resolution=100, grid_boundary=[-2.0, 2.0
         z.append(sdf(pnts.cuda()).detach().cpu().numpy())
     z = np.concatenate(z, axis=0)
 
-    if (not (np.min(z) > level or np.max(z) < level)):
+    if np.isfinite(z).all() and np.min(z) < level < np.max(z):
 
         z = z.astype(np.float32)
 
@@ -243,7 +244,10 @@ def get_surface_trace(path, epoch, sdf, resolution=100, grid_boundary=[-2.0, 2.0
         if return_mesh:
             return meshexport
         return traces
-    return None
+    warnings.warn(f'No scene surface at epoch {epoch}; exporting an empty prediction')
+    empty = trimesh.Trimesh(vertices=np.empty((0, 3)), faces=np.empty((0, 3), dtype=np.int64), process=False)
+    empty.export(os.path.join(path, f'surface_{epoch}_whole.ply'))
+    return empty if return_mesh else []
 
 # @torch.no_grad()
 # def get_surface_sliding(path, epoch, sdf, resolution=100, grid_boundary=[-2.0, 2.0], return_mesh=False, level=0):
@@ -363,9 +367,12 @@ def get_semantic_surface_trace(path, epoch, iter, sdf, resolution=100, grid_boun
     #     z_all.append(sdf(pnts.cuda()).detach().cpu().numpy())
     # z_all = np.concatenate(z_all, axis=0)
 
+    meshexport, traces = None, []
     for idx in range(num):
+        # Never reuse the preceding object's mesh/bbox when a field is empty.
+        meshexport, traces = None, []
 
-        if obj_bbox_dict is not None and idx != 0:          # 0 is bg
+        if obj_bbox_dict is not None and idx != 0 and idx in obj_bbox_dict:
             obj_bbox = obj_bbox_dict[idx]
             grid = get_grid_bbox(resolution, obj_bbox)
         else:
@@ -378,7 +385,7 @@ def get_semantic_surface_trace(path, epoch, iter, sdf, resolution=100, grid_boun
         z_all = np.concatenate(z_all, axis=0)
 
         z = z_all[:, idx]
-        if (not (np.min(z) > level or np.max(z) < level)):
+        if np.isfinite(z).all() and np.min(z) < level < np.max(z):
 
             z = z.astype(np.float32)
 
@@ -403,6 +410,15 @@ def get_semantic_surface_trace(path, epoch, iter, sdf, resolution=100, grid_boun
             meshexport = trimesh.Trimesh(verts, faces, normals)
             meshexport.export('{0}/surface_{1}_{2}.ply'.format(path, epoch, idx), 'ply')
             print(f'surface_{epoch}_{idx}.ply save to {path}')
+
+        if meshexport is None:
+            warnings.warn(f'No level-{level} surface for object {idx} at epoch {epoch}; exporting an empty prediction')
+            meshexport = trimesh.Trimesh(vertices=np.empty((0, 3)), faces=np.empty((0, 3), dtype=np.int64), process=False)
+            meshexport.export(os.path.join(path, f'surface_{epoch}_{idx}.ply'))
+            stale_bbox = os.path.join(path, 'bbox', f'bbox_{idx}.json')
+            if os.path.exists(stale_bbox):
+                os.remove(stale_bbox)
+            continue
 
         # export mesh bbox
         if iter > 25000:        # save bbox after 25000 iterations

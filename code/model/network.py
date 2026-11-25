@@ -9,6 +9,8 @@ import json
 from utils import rend_util
 from model.embedder import *
 from model.density import LaplaceDensity
+from model.op_residual import ResidualSDF, isolated_completion_prior
+from model.op_rendering import exclusive_object_opacity
 from model.ray_sampler import ErrorBoundSampler
 import matplotlib.pyplot as plt
 import numpy as np
@@ -233,9 +235,9 @@ class ImplicitNetwork(nn.Module):
         indices = indices.squeeze(-1)
 
         feature_vectors = output[:, self.d_out:]
-        d_output = torch.ones_like(sdf, requires_grad=False, device=sdf.device)
+        d_output = torch.ones_like(sdf_raw[:, idx:idx+1], requires_grad=False, device=sdf.device)
         gradients = torch.autograd.grad(
-            outputs=sdf,
+            outputs=sdf_raw[:, idx:idx+1],
             inputs=x,
             grad_outputs=d_output,
             create_graph=True,
@@ -284,7 +286,16 @@ class ObjectImplicitNetworkGrid(nn.Module):
             level_dim=2,
             divide_factor = 1.5, # used to normalize the points range for multi-res grid
             use_grid_feature = True, # use hash grid embedding or not, if not, it is a pure MLP with sin/cos embedding
-            sigmoid = 20
+            sigmoid = 20,
+            op_completion=False,
+            op_completion_width=32,
+            op_completion_bands=3,
+            op_completion_max_residual=0.2,
+            op_completion_hidden_visibility=0.1,
+            op_completion_visible_visibility=0.5,
+            op_completion_chunk_size=8192,
+            op_completion_conditioned=False,
+            op_completion_feature_levels=4
     ):
         super().__init__()
         
@@ -371,8 +382,37 @@ class ObjectImplicitNetworkGrid(nn.Module):
 
         self.pool = nn.MaxPool1d(self.d_out, return_indices=True)
         self.relu = nn.ReLU()
+        self.completion = None
+        self.completion_feature_dim = 0
+        if op_completion_conditioned:
+            if not op_completion:
+                raise ValueError("Local residual conditioning requires op_completion")
+            if not 0 <= op_completion_feature_levels <= num_levels:
+                raise ValueError("Residual feature levels must be between zero and the existing level count")
+            if op_completion_feature_levels and not use_grid_feature:
+                raise ValueError("Local residual conditioning requires the existing hash features")
+            self.completion_feature_dim = op_completion_feature_levels * level_dim
+        if op_completion:
+            # Do not perturb initialization of the original rendering network.
+            with torch.random.fork_rng(devices=[]):
+                self.completion = ResidualSDF(
+                    d_out, width=op_completion_width, bands=op_completion_bands,
+                    max_residual=op_completion_max_residual,
+                    hidden_visibility=op_completion_hidden_visibility,
+                    visible_visibility=op_completion_visible_visibility,
+                    coordinate_scale=divide_factor, chunk_size=op_completion_chunk_size,
+                    conditioned=op_completion_conditioned, feature_dim=self.completion_feature_dim)
+
+    def bind_completion_visibility(self, visgrid):
+        if self.completion is not None:
+            self.completion.bind_visibility(visgrid)
+
+    def activate_completion(self):
+        if self.completion is not None:
+            self.completion.activate()
 
     def forward(self, input):
+        scene_points = input
         if self.use_grid_feature:
             # normalize point range as encoding assume points are in [-1, 1]
             # assert torch.max(input / self.divide_factor)<1 and torch.min(input / self.divide_factor)>-1, 'range out of [-1, 1], max: {}, min: {}'.format(torch.max(input / self.divide_factor),  torch.min(input / self.divide_factor))
@@ -399,6 +439,12 @@ class ObjectImplicitNetworkGrid(nn.Module):
             if l < self.num_layers - 2:
                 x = self.softplus(x)
 
+        if self.completion is not None and self.completion.active:
+            base_sdf = x[:, :self.d_out]
+            coarse_feature = (feature[:, :self.completion_feature_dim]
+                              if self.completion_feature_dim else None)
+            sdf = base_sdf + self.completion(scene_points, base_sdf, coarse_feature)
+            x = torch.cat((sdf, x[:, self.d_out:]), dim=-1)
         return x
 
     def gradient(self, x):
@@ -501,9 +547,9 @@ class ObjectImplicitNetworkGrid(nn.Module):
         indices = indices.squeeze(-1)
 
         feature_vectors = output[:, self.d_out:]
-        d_output = torch.ones_like(sdf, requires_grad=False, device=sdf.device)
+        d_output = torch.ones_like(sdf_raw[:, idx:idx+1], requires_grad=False, device=sdf.device)
         gradients = torch.autograd.grad(
-            outputs=sdf,
+            outputs=sdf_raw[:, idx:idx+1],
             inputs=x,
             grad_outputs=d_output,
             create_graph=True,
@@ -534,6 +580,8 @@ class ObjectImplicitNetworkGrid(nn.Module):
         for l in range(0, self.num_layers - 1):
             lin = getattr(self, "lin" + str(l))
             parameters += list(lin.parameters())
+        if self.completion is not None:
+            parameters += list(self.completion.parameters())
         return parameters
 
     def grid_parameters(self, verbose=False):
@@ -733,6 +781,11 @@ class DPReconNetwork(nn.Module):
     def __init__(self, conf, prior_yaml, plots_dir, ft_folder, obj_num, prompt_path):
         super().__init__()
         self.feature_vector_size = conf.get_int('feature_vector_size')
+        self.op_unified_rendering = conf.get_bool('op_unified_rendering', default=False)
+        self.op_prior_scale_consistency = conf.get_bool('op_prior_scale_consistency', default=False)
+        # New runs must preserve these rendering semantics when resuming texture.
+        self.register_buffer('op_rendering_signature', torch.tensor(
+            [self.op_unified_rendering, self.op_prior_scale_consistency], dtype=torch.uint8))
         self.scene_bounding_sphere = conf.get_float('scene_bounding_sphere', default=1.0)
         self.white_bkgd = conf.get_bool('white_bkgd', default=False)
         self.bg_color = torch.tensor(conf.get_list("bg_color", default=[1.0, 1.0, 1.0])).float().cuda()
@@ -775,6 +828,7 @@ class DPReconNetwork(nn.Module):
                 prior_obj_idx_list=self.prior_obj_idx_list,
                 prompt_path=prompt_path,
                 plots_dir=self.plots_dir,
+                prior_scale_consistency=self.op_prior_scale_consistency,
             )
             self.color_vis_thresh = self.prior.color_vis_thresh
             self.bg_vis_thresh = self.prior.bg_vis_thresh
@@ -792,6 +846,9 @@ class DPReconNetwork(nn.Module):
             raise ValueError('No prior module is used, please check the configuration file')
 
     def forward(self, input, indices, iter_step=-1, render_obj_idx=None, visgrid=None):
+        # Activate only after the existing visibility initialization.
+        if self.Grid_MLP and self.begin_prior:
+            self.implicit_network.activate_completion()
         # Parse model input
         intrinsics = input["intrinsics"]
         uv = input["uv"]
@@ -832,12 +889,17 @@ class DPReconNetwork(nn.Module):
         else:
             weights, transmittance, dists = self.volume_rendering(z_vals, sdf) 
 
-        # rendering the occlusion-awared object opacity
-        object_opacity = self.occlusion_opacity(z_vals, transmittance, dists, sdf_raw).sum(-1).transpose(0, 1)
-
+        if self.op_unified_rendering:
+            # RGB, depth and instance supervision share the same ray-hit measure.
+            object_opacity = exclusive_object_opacity(
+                weights, sdf_raw, beta_cur, object_index=render_obj_idx)
+            semantic_values = object_opacity
+        else:
+            object_opacity = self.occlusion_opacity(
+                z_vals, transmittance, dists, sdf_raw).sum(-1).transpose(0, 1)
+            semantic_values = torch.sum(weights.unsqueeze(-1)*semantic, 1)
 
         rgb_values = torch.sum(weights.unsqueeze(-1) * rgb, 1)
-        semantic_values = torch.sum(weights.unsqueeze(-1)*semantic, 1)
         depth_values = torch.sum(weights * z_vals, 1, keepdims=True) / (weights.sum(dim=1, keepdims=True) +1e-8)
         # we should scale rendered distance to depth along z direction
         depth_values = depth_scale * depth_values
@@ -975,7 +1037,9 @@ class DPReconNetwork(nn.Module):
             bg_normals = bg_gradients / (bg_gradients.norm(2, -1, keepdim=True) + 1e-6)
             bg_normals = bg_normals.reshape(-1, N_samples_bg, 3)
             bg_normal_map = torch.sum(bg_weight.unsqueeze(-1) * bg_normals, 1)
-            bg_normal_map = rot @ bg_normal_map.permute(1, 0)
+            # pose may have been replaced by a virtual background camera.
+            bg_rot = pose[0, :3, :3].transpose(0, 1).contiguous()
+            bg_normal_map = bg_rot @ bg_normal_map.permute(1, 0)
             bg_normal_map = bg_normal_map.permute(1, 0).contiguous()
             output['bg_normal_map'] = bg_normal_map
 
@@ -1038,7 +1102,10 @@ class DPReconNetwork(nn.Module):
 
                 camera_batch = self.prior.get_camera_views(update_state, azimuth_range, elevation_range)
 
-            sds_loss_dict = self.prior.get_sds_loss(camera_batch, sim_obj_idx)
+            # SDS sees the composed field but cannot update observation/density/color
+            # parameters. Input derivatives remain available for normal rendering.
+            with isolated_completion_prior(self.implicit_network, self.density, self.rendering_network):
+                sds_loss_dict = self.prior.get_sds_loss(camera_batch, sim_obj_idx)
 
             if update_state:                                       # update after finish all object index
                 self.prior.true_global_step += 1
@@ -1168,6 +1235,8 @@ class DPReconNetwork(nn.Module):
         if return_all:
             return out
 
+        coverage = (out['opacity'].detach() > 0).float().mean().item()
+        print(f'[OP mesh rendering] coverage={coverage:.4f}; uncovered pixels use the renderer background')
         return out['comp_rgb'][0]
 
     def infer_color_anchor_views(self, anchor_bin=10, elevation_range = [25, 35]):

@@ -4,6 +4,7 @@ import os
 from datetime import datetime
 from pyhocon import ConfigFactory
 import sys
+import subprocess
 import torch
 from tqdm import tqdm
 import numpy as np
@@ -18,7 +19,10 @@ import utils.plots as plt
 from utils import rend_util
 from utils.general import get_time
 from model.loss import compute_scale_and_shift
-from utils.op_gradients import observation_protected_backward
+from utils.op_gradients import observation_protected_backward, joint_observation_backward
+from utils.op_observations import observation_references
+from utils.op_multiview import TrainingViewConsistency
+from utils.op_losses import masked_rgb_mse
 from utils.general import BackprojectDepth
 from datasets.scene_dataset import rot_cameras_along_x, rot_cameras_along_y
 import matplotlib.pyplot as matplt
@@ -40,9 +44,49 @@ class DPReconTrainRunner():
         self.conf = ConfigFactory.parse_file(kwargs['conf'])
         self.op_geometry_conflict = self.conf.get_bool('train.op_geometry_conflict', default=False)
         self.op_texture_conflict = self.conf.get_bool('train.op_texture_conflict', default=False)
-        self.op_projection_strength = self.conf.get_float('train.op_projection_strength', default=1.0)
-        if not 0.0 <= self.op_projection_strength <= 1.0:
-            raise ValueError('train.op_projection_strength must be in [0, 1]')
+        legacy_strength = self.conf.get_float('train.op_projection_strength', default=0.5)
+        self.op_geometry_strength = self.conf.get_float('train.op_geometry_strength', default=legacy_strength)
+        self.op_texture_strength = self.conf.get_float('train.op_texture_strength', default=legacy_strength)
+        self.op_observation_reference = self.conf.get_bool('train.op_observation_reference', default=False)
+        if not all(0.0 <= value <= 1.0 for value in (self.op_geometry_strength, self.op_texture_strength)):
+            raise ValueError('OP stage projection strengths must be in [0, 1]')
+        self.op_completion = self.conf.get_bool('model.implicit_network.op_completion', default=False)
+        rendering_modes = (
+            self.conf.get_bool('model.op_unified_rendering', default=False),
+            self.conf.get_bool('model.op_prior_scale_consistency', default=False))
+        if any(rendering_modes):
+            if self.conf.get_string('dataset.data_dir') != 'replica' or kwargs['batch_size'] != 1:
+                raise ValueError('OP unified rendering/scale consistency currently targets Replica, batch_size=1')
+            if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
+                raise ValueError('OP unified rendering/scale consistency currently targets a single GPU')
+            if self.conf.get_bool('model.implicit_network.op_completion_conditioned', default=False):
+                raise ValueError('Use the v4 coordinate-only residual with the new rendering changes')
+        self.op_v3_enabled = self.conf.get_bool('train.op_v3_enabled', default=False)
+        if self.op_completion:
+            if (self.conf.get_string('dataset.data_dir') != 'replica' or
+                    kwargs['batch_size'] != 1 or not self.conf.get_bool('model.Grid_MLP', default=False)):
+                raise ValueError('Residual SDF currently enables Replica Grid_MLP, batch_size=1 only')
+            if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
+                raise ValueError('Residual SDF currently targets single-GPU training')
+            if self.op_v3_enabled or self.op_geometry_conflict:
+                raise ValueError('Residual SDF replaces v3 and geometry gradient projection; disable both')
+            if kwargs['force_init_visgrid']:
+                raise ValueError('Residual SDF requires its original visibility; start a fresh run instead')
+        self.op_unified_prior = self.op_v3_enabled and self.conf.get_bool('train.op_unified_prior', default=False)
+        self.op_joint_reference = self.op_v3_enabled and self.conf.get_bool('train.op_joint_reference', default=False)
+        self.op_adaptive_protection = self.op_v3_enabled and self.conf.get_bool('train.op_adaptive_protection', default=False)
+        self.op_multiview = self.op_v3_enabled and self.conf.get_bool('train.op_multiview', default=False)
+        self.op_instance_interval = self.conf.get_int('train.op_instance_interval', default=4)
+        self.op_reference_min_pixels = self.conf.get_int('train.op_reference_min_pixels', default=4)
+        if self.op_instance_interval < 1 or self.op_reference_min_pixels < 1:
+            raise ValueError('OP reference intervals/counts must be positive')
+        if self.op_v3_enabled:
+            if self.conf.get_string('dataset.data_dir') != 'replica' or kwargs['batch_size'] != 1:
+                raise ValueError('OP v3 currently enables Replica with batch_size=1 only')
+            if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
+                raise ValueError('OP v3 currently targets single-GPU training')
+        self.op_mv = None
+        self.op_texture_step = 0
         self.batch_size = kwargs['batch_size']
         self.nepochs = kwargs['nepochs']
         self.exps_folder_name = kwargs['exps_folder_name']
@@ -120,6 +164,20 @@ class DPReconTrainRunner():
 
         self.train_dataset = utils.get_class(self.conf.get_string('train.dataset_class'))(**dataset_conf)
 
+        if self.op_multiview:
+            self.op_mv = TrainingViewConsistency(self.train_dataset,
+                max_points=self.conf.get_int('train.op_mv_max_points', default=32),
+                interval=self.conf.get_int('train.op_mv_interval', default=8),
+                warmup=self.conf.get_int('train.op_mv_warmup', default=5000),
+                ramp=self.conf.get_int('train.op_mv_ramp', default=2000),
+                depth_tolerance=self.conf.get_float('train.op_mv_depth_tolerance', default=0.05),
+                normal_cos_min=self.conf.get_float('train.op_mv_normal_cos_min', default=0.5),
+                depth_weight=self.conf.get_float('train.op_mv_depth_weight', default=0.05),
+                normal_weight=self.conf.get_float('train.op_mv_normal_weight', default=0.01),
+                reference_floor=self.conf.get_float('train.op_reference_floor', default=0.5),
+                ttl=self.conf.get_int('train.op_reference_ttl', default=2000))
+        if self.op_v3_enabled:
+            print('[OP v3] Replica only; single GPU; bounded scene/instance coordination and training-view checks')
         self.max_total_iters = self.conf.get_int('train.max_total_iters', default=200000)
         self.ds_len = len(self.train_dataset)
         print('Finish loading data. Data-set size: {0}'.format(self.ds_len))
@@ -165,10 +223,20 @@ class DPReconTrainRunner():
             self.visgrid = VisGrid(fill_data=0.0)
 
         self.Grid_MLP = self.model.Grid_MLP
+        if self.op_completion:
+            self.model.implicit_network.bind_completion_visibility(self.visgrid)
+            count = sum(p.numel() for p in self.model.implicit_network.completion.parameters())
+            mode = 'v5 locally conditioned' if self.model.implicit_network.completion.conditioned else 'v4 coordinate-only'
+            print(f'[OP residual SDF] {mode}; Replica only; {count} decoder parameters; shared grids; v2 texture')
+            print(f'[OP v6] unified_rendering={self.model.op_unified_rendering}; '
+                  f'prior_scale_consistency={self.model.op_prior_scale_consistency}')
         if torch.cuda.is_available():
             self.model.cuda()
 
-        self.loss = utils.get_class(self.conf.get_string('train.loss_class'))(**self.conf.get_config('loss'))
+        loss_conf = dict(self.conf.get_config('loss'))
+        if self.op_v3_enabled:
+            loss_conf['op_reference_maps'] = True
+        self.loss = utils.get_class(self.conf.get_string('train.loss_class'))(**loss_conf)
 
         # The MLP and hash grid should have different learning rates
         self.lr = self.conf.get_float('train.learning_rate')
@@ -209,6 +277,28 @@ class DPReconTrainRunner():
             print('[INFO]: Loading pretrained model from {}'.format(old_checkpnts_dir))
             saved_model_state = torch.load(
                 os.path.join(old_checkpnts_dir, 'ModelParameters', str(kwargs['checkpoint']) + ".pth"))
+            if self.op_completion:
+                state = saved_model_state["model_state_dict"]
+                if not any(k.endswith('completion.active_flag') for k in state):
+                    raise ValueError('Residual SDF requires a new geometry run; v1-v3 checkpoints are incompatible')
+                if "visgrid_state_dict" not in saved_model_state:
+                    raise ValueError('Residual SDF checkpoint is missing its required visibility grid')
+                decoder_key = 'module.implicit_network.completion.decoder.0.weight'
+                expected_shape = self.model.module.implicit_network.completion.decoder[0].weight.shape
+                if decoder_key not in state or state[decoder_key].shape != expected_shape:
+                    raise ValueError(
+                        'Residual decoder layout does not match this configuration. '
+                        'Train geometry from scratch with the selected residual layout; '
+                        'use the matching saved runconf.conf for historical checkpoints.'
+                    )
+            saved_signature = saved_model_state["model_state_dict"].get('module.op_rendering_signature')
+            expected_signature = self.model.module.op_rendering_signature.detach().cpu()
+            if any(rendering_modes) or saved_signature is not None:
+                if saved_signature is None or not torch.equal(saved_signature.detach().cpu(), expected_signature):
+                    raise ValueError(
+                        'Checkpoint rendering/scale modes differ from the current configuration. '
+                        'Start new geometry from scratch, or use its matching saved runconf.conf.'
+                    )
             self.model.load_state_dict(saved_model_state["model_state_dict"], strict=False)
             if "visgrid_state_dict" in saved_model_state and not self.force_init_visgrid:                       # if force_init_visgrid is True, we will not load visgrid
                 self.visgrid.load_state_dict(saved_model_state["visgrid_state_dict"])
@@ -270,6 +360,8 @@ class DPReconTrainRunner():
         self.iter_step = self.start_epoch * len(self.train_dataset)
         if self.iter_step >= self.add_prior_iter and not self.force_init_visgrid:
             self.model.module.begin_prior = True
+            if self.op_completion:
+                self.model.module.implicit_network.activate_completion()
             self.init_visgrid = False
 
             # continue training, copy prior bbox to current folder
@@ -280,7 +372,7 @@ class DPReconTrainRunner():
             shutil.copytree(continue_prior_bbox_path, dst_prior_bbox_path)
 
 
-    def _op_backward(self, reconstruction_loss, prior_loss, stage):
+    def _op_backward(self, reconstruction_loss, prior_loss, stage, reference_loss=None, references=None):
         model = self.model.module
         if stage == 'geometry':
             implicit = model.implicit_network
@@ -293,9 +385,23 @@ class DPReconTrainRunner():
         else:
             raise ValueError('Unknown OP stage: ' + stage)
         parameters = [p for group in self.optimizer.param_groups for p in group['params']]
+        if self.op_v3_enabled and references is not None:
+            return joint_observation_backward(reconstruction_loss, prior_loss, parameters, groups,
+                references=references, strength=self.op_geometry_strength if stage == 'geometry' else self.op_texture_strength,
+                adaptive=self.op_adaptive_protection)
         return observation_protected_backward(
             reconstruction_loss, prior_loss, parameters, groups,
-            strength=self.op_projection_strength)
+            strength=self.op_geometry_strength if stage == 'geometry' else self.op_texture_strength,
+            reference_loss=reference_loss if self.op_observation_reference else None)
+
+    def _op_references(self, per_ray, labels, uv, valid, view, step):
+        reliability = (self.op_mv.reliability(view, uv, step) if self.op_mv is not None
+                       else torch.ones_like(per_ray.reshape(-1)))
+        references, selected = observation_references(per_ray, labels.to(per_ray.device), reliability,
+            valid, step, instance_enabled=self.op_joint_reference, interval=self.op_instance_interval,
+            min_pixels=self.op_reference_min_pixels)
+        return references, {'op_instance_id': per_ray.detach().new_tensor(selected),
+                            'op_reference_confidence': references[0][1]}
 
     def save_checkpoints(self, epoch):
         if self.use_visgrid:
@@ -561,6 +667,8 @@ class DPReconTrainRunner():
                 matplt.close()
 
                 self.model.module.begin_prior = True
+                if self.op_completion:
+                    self.model.module.implicit_network.activate_completion()
                 print('********** begin add object prior **********')
 
                 if self.GPU_INDEX == 0:
@@ -675,17 +783,26 @@ class DPReconTrainRunner():
                 print('*********** filter bg artifacts by TSDF for better bg UV map ***********')
                 save_bg_mesh_path = os.path.join(self.plots_dir, f'surface_{epoch}_0_filtered.ply')
                 input_scalemat_path = os.path.join(self.train_dataset.instance_dir, 'eval-novel-views', 'cameras.npz')
-                tsdf_filter_cmd = f'python utils/tsdf_filter_util.py --input_mesh {bg_mesh_path} --save_mesh {save_bg_mesh_path} --input_scalemat {input_scalemat_path}'
-                print(tsdf_filter_cmd)
+                tsdf_filter_cmd = [
+                    sys.executable,
+                    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 'utils', 'tsdf_filter_util.py'),
+                    '--input_mesh', bg_mesh_path,
+                    '--save_mesh', save_bg_mesh_path,
+                    '--input_scalemat', input_scalemat_path,
+                ]
+                print('TSDF filter command:', tsdf_filter_cmd)
                 try:
-                    os.system(tsdf_filter_cmd)
-                    # replace bg_mesh_path with filtered mesh
+                    subprocess.run(tsdf_filter_cmd, check=True)
+                    if not os.path.isfile(save_bg_mesh_path) or os.path.getsize(save_bg_mesh_path) == 0:
+                        raise FileNotFoundError(f'TSDF filter produced no mesh: {save_bg_mesh_path}')
+                    # Keep the canonical mesh intact until its replacement is ready.
                     ori_bg_mesh_path = os.path.join(self.plots_dir, f'surface_{epoch}_0_ori.ply')
-                    shutil.move(bg_mesh_path, ori_bg_mesh_path)
-                    shutil.copyfile(save_bg_mesh_path, bg_mesh_path)
+                    shutil.copyfile(bg_mesh_path, ori_bg_mesh_path)
+                    os.replace(save_bg_mesh_path, bg_mesh_path)
                     print(f'bg mesh filtered, save to {bg_mesh_path}')
-                except:
-                    print('[INFO]: bg tsdf filter failed, use original bg mesh')
+                except Exception as exc:
+                    print(f'[WARNING]: bg TSDF filter failed; original bg mesh retained at {bg_mesh_path}: {exc}')
 
 
                 print('********** finish bg panorama generation, begin render color image **********')
@@ -876,6 +993,19 @@ class DPReconTrainRunner():
             if self.iter_step >= self.add_color_prior_iter and self.init_color_mesh:
 
                 if self.ft_folder is not None:
+                    # Check all scene meshes before copying inputs or rendering anchors.
+                    src_plots_dir = os.path.join(self.ft_folder, 'plots')
+                    missing_meshes = [
+                        os.path.join(src_plots_dir, f'surface_{epoch}_{i}.ply')
+                        for i in range(self.n_sem)
+                        if not os.path.isfile(os.path.join(src_plots_dir, f'surface_{epoch}_{i}.ply'))
+                    ]
+                    if missing_meshes:
+                        raise FileNotFoundError(
+                            f'Missing geometry meshes for texture initialization (epoch {epoch}): '
+                            + ', '.join(missing_meshes)
+                            + '. Repair the geometry exports before starting texture training.'
+                        )
                     src_pano_path = os.path.join(self.ft_folder, 'plots', 'sds_views', 'obj_0', 'bg_pano')
                     dst_pano_path = os.path.join(self.plots_dir, 'sds_views', 'obj_0', 'bg_pano')
                     shutil.copytree(src_pano_path, dst_pano_path)
@@ -1006,10 +1136,15 @@ class DPReconTrainRunner():
                         out = self.model.module.get_scene_rgb(merge_model_input, indices, height=self.img_res[0], width=self.img_res[1], return_all=True)
                         pred_scene_rgb = out['comp_rgb']
                         vis_mask = out["vis_map"] >= self.model.module.bg_vis_thresh
-                        vis_mask[0] = torch.ones_like(vis_mask[0])          # input scene image should be all visible
-
-                        pred_scene_rgb = pred_scene_rgb * vis_mask
-                        gt_scene_rgb = merge_gt_rgb * vis_mask
+                        vis_mask[0] = torch.ones_like(vis_mask[0])
+                        coverage = out['opacity'].detach() > 0
+                        vis_mask = vis_mask & coverage
+                        # Only image 0 is an actual training observation. Synthetic
+                        # NeRF anchors/panorama still train texture but are not protected.
+                        observation_rgb_loss = masked_rgb_mse(pred_scene_rgb[:1], merge_gt_rgb[:1], coverage[:1])
+                        gt_scene_rgb = merge_gt_rgb
+                        if data_index % 20 == 0:
+                            print(f'[OP texture] observed mesh coverage={coverage[0].float().mean().item():.4f}')
 
                         # # visulize pred and gt rgb
                         # if delta_epoch % 10 == 0:
@@ -1027,7 +1162,25 @@ class DPReconTrainRunner():
                         #         cat_rgb.paste(gt_rgb, (self.img_res[0], 0))
                         #         cat_rgb.save(cat_rgb_save_path)
 
-                        scene_rgb_loss = F.mse_loss(pred_scene_rgb, gt_scene_rgb)
+                        scene_rgb_loss = masked_rgb_mse(pred_scene_rgb, gt_scene_rgb, vis_mask)
+                        if self.op_v3_enabled:
+                            visible_count = vis_mask.expand_as(pred_scene_rgb).sum().clamp_min(1)
+                            observed_count = vis_mask[:1].expand_as(pred_scene_rgb[:1]).sum()
+                            anchor_count = vis_mask[1:].expand_as(pred_scene_rgb[1:]).sum()
+                            observed_contribution = observation_rgb_loss * observed_count / visible_count
+                            anchor_contribution = masked_rgb_mse(pred_scene_rgb[1:], gt_scene_rgb[1:], vis_mask[1:]) * anchor_count / visible_count
+                            # Avoid subtracting branches of a combined loss graph.
+                            scene_rgb_loss = observed_contribution + anchor_contribution
+                            texture_references = None
+                            texture_stats = {}
+                            if self.op_mv is not None:
+                                _, texture_stats = self.op_mv.texture(self.model.module, int(indices.item()),
+                                    model_input['uv'][0], out, ground_truth['segs'], self.op_texture_step)
+                            pixel_error = (pred_scene_rgb[0]-gt_scene_rgb[0]).square().mean(-1).reshape(-1)
+                            texture_references, reference_stats = self._op_references(
+                                pixel_error*self.scene_rgb_loss_weight, ground_truth['segs'], model_input['uv'][0],
+                                coverage[0].reshape(-1), int(indices.item()), self.op_texture_step)
+                            texture_stats.update(reference_stats)
 
                         bg_pano_loss = self.model.module.get_bg_pano_loss()
 
@@ -1036,13 +1189,23 @@ class DPReconTrainRunner():
 
                         loss = scene_rgb_loss * self.scene_rgb_loss_weight + sd_loss * self.sds_rgb_loss_weight + bg_pano_loss * self.bg_pano_rgb_loss_weight
                         if self.op_texture_conflict:
-                            op_stats = self._op_backward(
-                                scene_rgb_loss * self.scene_rgb_loss_weight + bg_pano_loss * self.bg_pano_rgb_loss_weight,
-                                sd_loss * self.sds_rgb_loss_weight, stage='texture')
+                            if self.op_unified_prior:
+                                base = observed_contribution * self.scene_rgb_loss_weight
+                                prior = (anchor_contribution*self.scene_rgb_loss_weight
+                                         + bg_pano_loss*self.bg_pano_rgb_loss_weight + sd_loss*self.sds_rgb_loss_weight)
+                            else:
+                                base = scene_rgb_loss*self.scene_rgb_loss_weight + bg_pano_loss*self.bg_pano_rgb_loss_weight
+                                prior = sd_loss*self.sds_rgb_loss_weight
+                            op_stats = self._op_backward(base, prior, stage='texture',
+                                reference_loss=observation_rgb_loss*self.scene_rgb_loss_weight,
+                                references=texture_references if self.op_v3_enabled else None)
+                            if self.op_v3_enabled:
+                                op_stats.update(texture_stats)
                             if data_index % 20 == 0:
                                 print('[OP texture] ' + ', '.join(f'{k}={v.item():.4f}' for k, v in op_stats.items()))
                         else:
                             loss.backward()
+                        self.op_texture_step += 1
 
                         self.optimizer.step()
                         self.scheduler.step()
@@ -1155,11 +1318,25 @@ class DPReconTrainRunner():
                     
                         loss_output = self.loss(model_outputs, ground_truth, call_reg=True) if\
                                 self.iter_step >= self.add_objectvio_iter else self.loss(model_outputs, ground_truth, call_reg=False)
-                        # if change the pixel sampling pattern to patch, then you can add a TV loss to enforce some smoothness constraint
+                        per_ray = loss_output.pop('observation_per_ray', None)
+                        geometry_references = None
+                        if self.op_v3_enabled:
+                            if self.op_mv is not None:
+                                mv_loss, mv_stats = self.op_mv.geometry(self.model.module, int(indices.item()),
+                                    model_input, model_outputs, ground_truth, self.iter_step)
+                                loss_output['loss'] = loss_output['loss'] + mv_loss
+                                loss_output['reconstruction_loss'] = loss_output['reconstruction_loss'] + mv_loss
+                                loss_output.update(mv_stats)
+                            geometry_references, reference_stats = self._op_references(per_ray,
+                                ground_truth['segs'], model_input['uv'][0],
+                                torch.isfinite(ground_truth['rgb'].to(per_ray.device)).all(-1).reshape(-1),
+                                int(indices.item()), self.iter_step)
+                            loss_output.update(reference_stats)
                         loss = loss_output['loss']
                         if controlled and 'sds_loss' in loss_output:
                             loss_output.update(self._op_backward(
-                                loss_output['reconstruction_loss'], loss_output['sds_loss'], stage='geometry'))
+                                loss_output['reconstruction_loss'], loss_output['sds_loss'], stage='geometry',
+                                reference_loss=loss_output['observation_loss'], references=geometry_references))
                         else:
                             loss.backward()
 

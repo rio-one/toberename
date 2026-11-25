@@ -341,6 +341,9 @@ class NVDiffRasterizer(Rasterizer):
             selector = mask[..., 0]
 
             gb_pos, _ = self.ctx.interpolate_one(mesh.v_pos, rast, mesh.t_pos_idx)
+            # Reuse already-computed geometry for bounded training-view checks.
+            # These outputs do not change comp_rgb or background compositing.
+            out.update({'surface_position': gb_pos, 'surface_normal_world': gb_normal})
             gb_viewdirs = F.normalize(
                 gb_pos - camera_positions[:, None, None, :], dim=-1
             )

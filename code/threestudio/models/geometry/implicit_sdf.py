@@ -26,6 +26,25 @@ class PseudoSDF(nn.Module):
         self.shape_init_params = shape_init_params
         self.visgrid = None
         self.use_visgrid = False
+        self.scale_consistent = False
+        self.prior_radius = 1.0
+
+    def get_sdf_scale(self):
+        """Scene-to-prior distance scale, including the [-r,r] -> [0,1] map."""
+        if self.obj_idx_list is None:
+            raise ValueError('Select the prior object before querying its scale')
+        if 0 in self.obj_idx_list:
+            return 1.0
+        if not self.scale_consistent:
+            return self.shape_scale
+        if self.obj_bbox is None:
+            raise ValueError('Foreground prior requires its bounding box')
+        lengths = [self.obj_bbox[1][i] - self.obj_bbox[0][i] - 0.2 for i in range(3)]
+        max_length = max(lengths)
+        if (not np.isfinite(max_length) or max_length <= 0 or
+                not np.isfinite(self.prior_radius) or self.prior_radius <= 0):
+            raise ValueError('Prior coordinate scale must be positive and finite')
+        return 2.0 * self.prior_radius * self.shape_init_params / max_length
 
     def convert_coord(self, x):
         '''
@@ -66,7 +85,7 @@ class PseudoSDF(nn.Module):
         if 0 not in self.obj_idx_list:                    # bg not need to scale
             x = self.convert_coord(x)
             obj_sdfs = self.pseudo_sdf_network(x)[:, self.obj_idx_list]
-            output = torch.min(obj_sdfs, dim=1).values * self.shape_scale
+            output = torch.min(obj_sdfs, dim=1).values * self.get_sdf_scale()
         else:
             obj_sdfs = self.pseudo_sdf_network(x)[:, self.obj_idx_list]
             output = torch.min(obj_sdfs, dim=1).values
@@ -87,7 +106,7 @@ class PseudoSDF(nn.Module):
             x = self.convert_coord(x)
             _, feature_vectors, gradients, _, sdf_raw = self.pseudo_sdf_network.get_outputs(x)
             obj_sdfs = sdf_raw[:, self.obj_idx_list]
-            obj_sdf = torch.min(obj_sdfs, dim=1).values * self.shape_scale
+            obj_sdf = torch.min(obj_sdfs, dim=1).values * self.get_sdf_scale()
         else:
             _, feature_vectors, gradients, _, sdf_raw = self.pseudo_sdf_network.get_outputs(x)
             obj_sdfs = sdf_raw[:, self.obj_idx_list]

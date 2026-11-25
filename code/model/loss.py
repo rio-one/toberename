@@ -3,6 +3,7 @@ from torch import nn
 import utils.general as utils
 import math
 import torch.nn.functional as F
+from utils.op_losses import real_neighbor_depth_loss
 
 # copy from MiDaS
 def compute_scale_and_shift(prediction, target, mask):
@@ -160,7 +161,9 @@ class MonoSDFLoss(nn.Module):
                  depth_weight = 0.1,
                  normal_l1_weight = 0.05,
                  normal_cos_weight = 0.05,
-                 end_step = -1):
+                 end_step = -1,
+                 op_depth_neighbors=False,
+                 op_valid_normals=False):
         super().__init__()
         self.eikonal_weight = eikonal_weight
         self.rgb_weight = rgb_weight
@@ -175,6 +178,8 @@ class MonoSDFLoss(nn.Module):
         
         # print(f"using weight for loss RGB_1.0 EK_{self.eikonal_weight} SM_{self.smooth_weight} Depth_{self.depth_weight} NormalL1_{self.normal_l1_weight} NormalCos_{self.normal_cos_weight}")
         
+        self.op_depth_neighbors = op_depth_neighbors
+        self.op_valid_normals = op_valid_normals
         self.step = 0
         self.end_step = end_step
 
@@ -241,11 +246,15 @@ class MonoSDFLoss(nn.Module):
 
         return depth_loss
         
-    def get_normal_loss(self, normal_pred, normal_gt):
+    def get_normal_loss(self, normal_pred, normal_gt, mask=None):
         normal_gt = torch.nn.functional.normalize(normal_gt, p=2, dim=-1)
         normal_pred = torch.nn.functional.normalize(normal_pred, p=2, dim=-1)
-        l1 = torch.abs(normal_pred - normal_gt).sum(dim=-1).mean()
-        cos = (1. - torch.sum(normal_pred * normal_gt, dim = -1)).mean()
+        l1 = torch.abs(normal_pred - normal_gt).sum(dim=-1)
+        cos = 1. - torch.sum(normal_pred * normal_gt, dim=-1)
+        if mask is not None:
+            valid = mask.squeeze(-1).to(l1)
+            return (l1 * valid).sum() / valid.sum().clamp_min(1), (cos * valid).sum() / valid.sum().clamp_min(1)
+        l1, cos = l1.mean(), cos.mean()
         return l1, cos
         
     def forward(self, model_outputs, ground_truth):
@@ -273,12 +282,24 @@ class MonoSDFLoss(nn.Module):
         # combine with GT
         mask = (ground_truth['mask'] > 0.5).cuda() & mask
 
-        depth_loss = self.get_depth_loss(depth_pred, depth_gt, mask) if self.depth_weight > 0 else torch.tensor(0.0).cuda().float()
+        if self.depth_weight <= 0:
+            depth_loss = depth_pred.sum() * 0
+        elif self.op_depth_neighbors:
+            depth_loss = real_neighbor_depth_loss(
+                depth_pred, depth_gt * 4.0 + 0.5, mask,
+                ground_truth['sample_uv'].to(depth_pred.device), ground_truth['segs'].to(depth_pred.device))
+        else:
+            depth_loss = self.get_depth_loss(depth_pred, depth_gt, mask)
         if isinstance(depth_loss, float):
             depth_loss = torch.tensor(0.0).cuda().float()    
         # depth_loss = self.get_depth_rank_loss(depth_pred, depth_gt, mask)
         
-        normal_l1, normal_cos = self.get_normal_loss(normal_pred * mask, normal_gt)
+        if self.op_valid_normals:
+            normal_mask = (mask & torch.isfinite(normal_gt).all(dim=-1, keepdim=True)
+                           & (normal_gt.norm(dim=-1, keepdim=True) > 1e-6))
+            normal_l1, normal_cos = self.get_normal_loss(normal_pred, torch.nan_to_num(normal_gt), normal_mask)
+        else:
+            normal_l1, normal_cos = self.get_normal_loss(normal_pred * mask, normal_gt)
         
         smooth_loss = self.get_smooth_loss(model_outputs)
         
@@ -325,7 +346,10 @@ class DPReconLoss(MonoSDFLoss):
                  bg_reg_weight = 0.1,
                  sds_weight = 0.00001,
                  bg_surface_obj_reg_weight = 0.1,
-                 end_step = -1):
+                 end_step = -1,
+                 op_depth_neighbors=False,
+                 op_valid_normals=False,
+                 op_reference_maps=False):
         super().__init__(
                  rgb_loss = rgb_loss, 
                  eikonal_weight = eikonal_weight, 
@@ -334,7 +358,10 @@ class DPReconLoss(MonoSDFLoss):
                  depth_weight = depth_weight,
                  normal_l1_weight = normal_l1_weight,
                  normal_cos_weight = normal_cos_weight,
-                 end_step = end_step)
+                 end_step = end_step,
+                 op_depth_neighbors=op_depth_neighbors,
+                 op_valid_normals=op_valid_normals)
+        self.op_reference_maps = op_reference_maps
         self.semantic_weight = semantic_weight
         self.bg_reg_weight = bg_reg_weight
         self.sds_weight = sds_weight
@@ -505,4 +532,31 @@ class DPReconLoss(MonoSDFLoss):
         # Keep the reference graph independent of SDS; subtraction would still
         # traverse the expensive prior graph during the reference backward.
         output['reconstruction_loss'] = reconstruction_loss + regularization_loss
+        # RGB and training instance labels are direct observations. Monocular
+        # depth/normals, background smoothness and collision terms stay auxiliary.
+        output['observation_loss'] = self.rgb_weight * output['rgb_loss'] + self.semantic_weight * semantic_loss
+        if self.op_reference_maps:
+            prediction = model_outputs['rgb_values'].reshape(-1, 3)
+            target = ground_truth['rgb'].to(prediction).reshape(-1, 3)
+            if isinstance(self.rgb_loss, nn.L1Loss):
+                rgb_map = (prediction-target).abs().mean(-1)
+            elif isinstance(self.rgb_loss, nn.MSELoss):
+                rgb_map = (prediction-target).square().mean(-1)
+            else:
+                raise TypeError('OP references require L1/MSE RGB loss')
+            if 'rgb_sampling_weight' in ground_truth:
+                rgb_map = rgb_map * ground_truth['rgb_sampling_weight'].to(prediction).reshape(-1)
+            if self.use_obj_opacity and 'object_opacity' in model_outputs:
+                opacity = model_outputs['object_opacity'].clamp(1e-4, 1-1e-4)
+                labels = ground_truth['segs'].to(opacity.device).long().reshape(-1)
+                target = F.one_hot(labels, num_classes=opacity.shape[-1]).to(opacity)
+                semantic_map = F.binary_cross_entropy(opacity, target, reduction='none').mean(-1)
+            elif 'semantic_values' in model_outputs and isinstance(self.semantic_loss, nn.CrossEntropyLoss):
+                semantic_map = F.cross_entropy(model_outputs['semantic_values'],
+                    ground_truth['segs'].to(prediction.device).long().reshape(-1),
+                    ignore_index=self.semantic_loss.ignore_index, reduction='none')
+            else:
+                semantic_map = torch.zeros_like(rgb_map)
+            # Trainer consumes/removes this vector before scalar logging.
+            output['observation_per_ray'] = self.rgb_weight*rgb_map + self.semantic_weight*semantic_map
         return output

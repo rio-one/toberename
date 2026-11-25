@@ -1,4 +1,5 @@
 import math
+import weakref
 import nerfacc
 import torch
 import torch.nn as nn
@@ -17,14 +18,21 @@ from threestudio.utils.typing import *
 
 
 class PseudoVolsdfDensity(nn.Module):
-    def __init__(self, recon_density):
+    def __init__(self, recon_density, sdf_network=None):
         super(PseudoVolsdfDensity, self).__init__()
-        
         self.pseudo_density = recon_density
+        # Reference the existing adapter; do not register another geometry tree.
+        self._sdf_network = None if sdf_network is None else weakref.ref(sdf_network)
 
     def forward(self, sdf):
-        
-        return self.pseudo_density(sdf)
+        source = None if self._sdf_network is None else self._sdf_network()
+        if source is None or not getattr(source, 'scale_consistent', False):
+            return self.pseudo_density(sdf)
+        scale = source.get_sdf_scale()
+        # f_prior=a*f_scene, dt_prior=a*dt_scene:
+        # sigma_prior(f_prior)=sigma_scene(f_prior/a)/a.
+        # This is equivalent to beta_prior=a*beta_scene for Laplace density.
+        return self.pseudo_density(sdf / scale) / scale
 
 
 @threestudio.register("neus-volume-renderer")
@@ -85,7 +93,7 @@ class NeuSVolumeRenderer(VolumeRenderer):
         #     )
         self.cos_anneal_ratio = 1.0
 
-        self.density = PseudoVolsdfDensity(recon_density)
+        self.density = PseudoVolsdfDensity(recon_density, self.geometry.sdf_network)
 
         print(f'use {self.cfg.estimator} estimator for ray sampling.')
 

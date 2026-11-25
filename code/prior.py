@@ -36,7 +36,7 @@ from PIL import Image
 
 
 class PriorModule(nn.Module, SaverMixin):
-    def __init__(self, prior_yaml, recon_sdf, recon_color, recon_density, prior_obj_idx_list, prompt_path, plots_dir, device='cuda'):
+    def __init__(self, prior_yaml, recon_sdf, recon_color, recon_density, prior_obj_idx_list, prompt_path, plots_dir, device='cuda', prior_scale_consistency=False):
 
         super(PriorModule, self).__init__()
 
@@ -71,6 +71,11 @@ class PriorModule(nn.Module, SaverMixin):
         print(f'*********** shape_init_params: {shape_init_params} ***********')
 
         self.geometry.set_sdf_network(recon_sdf, shape_init_params)
+        if prior_scale_consistency:
+            if self.geometry.unbounded or self.geometry.cfg.sdf_bias != 0.0:
+                raise ValueError('Scale-consistent prior requires bounded, unbiased SDF coordinates')
+            self.geometry.sdf_network.scale_consistent = True
+            self.geometry.sdf_network.prior_radius = float(self.geometry.cfg.radius)
         self.geometry.set_color_network(recon_color, shape_init_params)
 
         self.material = threestudio.find(cfg.system.material_type)(cfg.system.material).to(device)
@@ -141,7 +146,9 @@ class PriorModule(nn.Module, SaverMixin):
 
         mesh_list = []
         for mesh_path in mesh_path_list:
-            mesh = trimesh.load(mesh_path)
+            mesh = trimesh.load(mesh_path, force='mesh')
+            if len(mesh.faces) == 0:
+                raise ValueError(f'Empty color mesh: {mesh_path}. Reconstruct/export geometry before texture optimization.')
             mesh_list.append(mesh)
         merge_mesh = trimesh.util.concatenate(mesh_list)
 

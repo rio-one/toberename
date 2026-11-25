@@ -49,9 +49,10 @@ class SceneDatasetDN_segs(torch.utils.data.Dataset):
                  use_mask=False,
                  num_views=-1,
                  op_balanced_sampling=False,
-                 op_instance_fraction=0.25,
-                 op_boundary_fraction=0.25,
-                 op_boundary_width=5
+                 op_instance_fraction=0.125,
+                 op_boundary_fraction=0.125,
+                 op_boundary_width=5,
+                 op_boundary_pairs=True
                  ):
 
         # self.instance_dir = os.path.join('../data', data_dir, 'scan{0}'.format(scan_id))
@@ -223,7 +224,7 @@ class SceneDatasetDN_segs(torch.utils.data.Dataset):
         # Each worker draws from the current view rather than a stale global index.
         self.op_sampler = (InstanceBoundarySampler(
             self.semantic_images, self.img_res, op_instance_fraction,
-            op_boundary_fraction, op_boundary_width) if op_balanced_sampling else None)
+            op_boundary_fraction, op_boundary_width, op_boundary_pairs) if op_balanced_sampling else None)
 
     def __len__(self):
         return self.n_images
@@ -287,6 +288,7 @@ class SceneDatasetDN_segs(torch.utils.data.Dataset):
                 sample["uv"] = uv[patch_sampling_idx, :]
                 sample["is_patch"] = torch.tensor([True])
         
+        ground_truth['sample_uv'] = sample['uv']
         return idx, sample, ground_truth
 
 

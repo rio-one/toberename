@@ -123,7 +123,8 @@ class StableDiffusionGuidance(BaseObject):
         if self.cfg.use_sjc:
             # score jacobian chaining use DDPM
             self.scheduler = DDPMScheduler.from_pretrained(
-                self.cfg.pretrained_model_name_or_path,
+                "/home/seed/wangruiyao/DP-Recon/code/pretrained_models/huggingface/hub/models--stabilityai--stable-diffusion-2-1-base/snapshots/5ede9e4bf3e3fd1cb0ef2f7a3fff13ee514fdf06",
+                local_files_only=True,
                 subfolder="scheduler",
                 torch_dtype=self.weights_dtype,
                 beta_start=0.00085,
@@ -132,7 +133,8 @@ class StableDiffusionGuidance(BaseObject):
             )
         else:
             self.scheduler = DDIMScheduler.from_pretrained(
-                self.cfg.pretrained_model_name_or_path,
+                "/home/seed/wangruiyao/DP-Recon/code/pretrained_models/huggingface/hub/models--stabilityai--stable-diffusion-2-1-base/snapshots/5ede9e4bf3e3fd1cb0ef2f7a3fff13ee514fdf06",
+                local_files_only=True,
                 subfolder="scheduler",
                 torch_dtype=self.weights_dtype,
             )
